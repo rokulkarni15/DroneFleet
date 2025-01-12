@@ -1,173 +1,237 @@
-from typing import List, Tuple, Dict, Optional
-import numpy as np
+from typing import List, Tuple, Optional, Dict, Set
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 import heapq
-from datetime import datetime
 import math
-
-@dataclass
-class WeatherCondition:
-    wind_speed: float  # meters per second
-    wind_direction: float  # degrees from north
-    precipitation: float  # mm/hour
-    visibility: float  # kilometers
+from .weather import WeatherCondition
 
 @dataclass
 class RoutePoint:
-    position: Tuple[float, float]  # (latitude, longitude)
-    altitude: float  # meters
+    position: Tuple[float, float]
+    altitude: float
     time: datetime
-    weather: Optional[WeatherCondition] = None
 
 class RouteOptimizer:
-    def __init__(self, 
-                 no_fly_zones: List[List[Tuple[float, float]]] = None,
-                 min_altitude: float = 100.0,
-                 max_altitude: float = 400.0):
-        self.no_fly_zones = no_fly_zones or []
-        self.min_altitude = min_altitude
-        self.max_altitude = max_altitude
-        self.safety_margin = 50.0  # meters
-        self.grid_size = 0.001  # approximately 100m in latitude/longitude
+    def __init__(self):
+        self.grid_size = 0.002  # Approximately 200 meters
+        self.min_altitude = 100.0
+        self.max_altitude = 400.0
+        self.safety_margin = 50.0
+        self.base_position = (37.7749, -122.4194)
+        self.no_fly_radius = 0.5  # 500m radius
+
+        # Define movement patterns
+        small_step = self.grid_size
+        medium_step = self.grid_size * 2
+        large_step = self.grid_size * 3
+
+        self.movements = [
+            # Outward movement patterns
+            (0, large_step), (large_step, 0),
+            (0, -large_step), (-large_step, 0),
+            (medium_step, medium_step), (medium_step, -medium_step),
+            (-medium_step, medium_step), (-medium_step, -medium_step),
+            # Fine adjustments
+            (small_step, 0), (-small_step, 0),
+            (0, small_step), (0, -small_step),
+            (small_step, small_step), (-small_step, small_step),
+            (small_step, -small_step), (-small_step, -small_step)
+        ]
 
     def calculate_route(self,
                        start: Tuple[float, float],
                        end: Tuple[float, float],
-                       weather_data: Optional[Dict[Tuple[float, float], WeatherCondition]] = None) -> List[RoutePoint]:
-        """Calculate optimal route considering obstacles and weather conditions."""
+                       weather: Optional[WeatherCondition] = None) -> List[RoutePoint]:
+        """Calculate optimal route considering weather and no-fly zones."""
+        print(f"\nCalculating route from {start} to {end}")
         
-        # Initialize path with A* algorithm
-        path = self._a_star_search(start, end)
+        path = self._find_path(start, end, weather)
+        
         if not path:
-            return []
+            print("No path found, using fallback path")
+            return self._create_fallback_path(start, end)
 
-        # Optimize altitude profile
-        route_points = self._create_altitude_profile(path)
+        # Convert path to route points
+        route_points = []
+        current_time = datetime.utcnow()
+        total_distance = 0
 
-        # Apply weather optimizations if weather data is available
-        if weather_data:
-            route_points = self._optimize_for_weather(route_points, weather_data)
+        for i in range(len(path)):
+            if i > 0:
+                segment_dist = self._calculate_distance(path[i-1], path[i])
+                total_distance += segment_dist
 
-        # Smooth the path
-        smoothed_route = self._smooth_path(route_points)
+            altitude = self._calculate_safe_altitude(path[i], weather)
+            route_points.append(RoutePoint(
+                position=path[i],
+                altitude=altitude,
+                time=current_time + timedelta(minutes=2*i)
+            ))
 
-        return smoothed_route
+        print(f"Total route distance: {total_distance:.2f} km")
+        return route_points
 
-    def _a_star_search(self, start: Tuple[float, float], end: Tuple[float, float]) -> List[Tuple[float, float]]:
-        """A* pathfinding algorithm implementation."""
-        def heuristic(a: Tuple[float, float], b: Tuple[float, float]) -> float:
-            return self._calculate_distance(a, b)
+    def _find_path(self, 
+                  start: Tuple[float, float], 
+                  end: Tuple[float, float],
+                  weather: Optional[WeatherCondition]) -> List[Tuple[float, float]]:
+        """A* pathfinding implementation."""
+        print("\nA* Pathfinding Details:")
+        print(f"Start: {start}")
+        print(f"End: {end}")
+        print(f"Grid size: {self.grid_size}")
 
-        def get_neighbors(pos: Tuple[float, float]) -> List[Tuple[float, float]]:
-            lat, lon = pos
-            neighbors = []
-            for dlat in [-self.grid_size, 0, self.grid_size]:
-                for dlon in [-self.grid_size, 0, self.grid_size]:
-                    if dlat == 0 and dlon == 0:
-                        continue
-                    new_pos = (lat + dlat, lon + dlon)
-                    if not self._is_in_no_fly_zone(new_pos):
-                        neighbors.append(new_pos)
-            return neighbors
+        def heuristic(point: Tuple[float, float]) -> float:
+            """Calculate heuristic distance."""
+            dx = abs(end[0] - point[0])
+            dy = abs(end[1] - point[1])
+            base_cost = math.sqrt(dx * dx + dy * dy)
+            
+            # Add NFZ influence
+            nfz_dist = self._calculate_distance(self.base_position, point)
+            nfz_factor = 1.0
+            if nfz_dist < self.no_fly_radius * 1.5:
+                nfz_factor = 2.0
+                
+            return base_cost * nfz_factor * 0.9
 
-        # Initialize the open and closed sets
-        open_set = [(0, start)]
+        open_set = []
+        heapq.heappush(open_set, (0, start))
         came_from = {}
         g_score = {start: 0}
-        f_score = {start: heuristic(start, end)}
-        closed_set = set()
+        f_score = {start: heuristic(start)}
+        explored = set()
+        
+        iteration = 0
+        max_iterations = 1000
 
-        while open_set:
+        while open_set and iteration < max_iterations:
+            iteration += 1
             current = heapq.heappop(open_set)[1]
+            
+            if current in explored:
+                continue
+                
+            print(f"Exploring point: {current}")
+            explored.add(current)
 
-            if self._calculate_distance(current, end) < self.grid_size:
-                return self._reconstruct_path(came_from, current, start)
+            if self._is_goal_reached(current, end):
+                print("Goal reached! Reconstructing path...")
+                return self._reconstruct_path(came_from, current)
 
-            closed_set.add(current)
-
-            for neighbor in get_neighbors(current):
-                if neighbor in closed_set:
+            for dx, dy in self.movements:
+                neighbor = (
+                    round(current[0] + dx, 6),
+                    round(current[1] + dy, 6)
+                )
+                
+                if neighbor in explored:
                     continue
 
-                tentative_g_score = g_score[current] + self._calculate_distance(current, neighbor)
+                if not self._is_valid_point(neighbor):
+                    continue
+
+                movement_cost = math.sqrt(dx*dx + dy*dy)
+
+                # Add weather cost
+                if weather:
+                    weather_cost = self._calculate_weather_cost(neighbor, weather)
+                    print(f"Weather cost for point {neighbor}: {weather_cost}")
+                    movement_cost *= (1 + weather_cost)
+
+                tentative_g_score = g_score[current] + movement_cost
 
                 if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
                     came_from[neighbor] = current
                     g_score[neighbor] = tentative_g_score
-                    f_score[neighbor] = g_score[neighbor] + heuristic(neighbor, end)
-                    heapq.heappush(open_set, (f_score[neighbor], neighbor))
+                    f_score = tentative_g_score + heuristic(neighbor)
+                    heapq.heappush(open_set, (f_score, neighbor))
 
+        print(f"No path found after {iteration} iterations")
         return []
 
-    def _create_altitude_profile(self, path: List[Tuple[float, float]]) -> List[RoutePoint]:
-        """Create altitude profile for the route."""
-        route_points = []
-        current_time = datetime.now()
-
-        for i, point in enumerate(path):
-            # Calculate optimal altitude based on distance from obstacles
-            optimal_altitude = self._calculate_optimal_altitude(point)
-            
-            route_points.append(RoutePoint(
-                position=point,
-                altitude=optimal_altitude,
-                time=current_time
-            ))
-
-        return route_points
-
-    def _optimize_for_weather(self, 
-                            route_points: List[RoutePoint],
-                            weather_data: Dict[Tuple[float, float], WeatherCondition]) -> List[RoutePoint]:
-        """Optimize route considering weather conditions."""
-        optimized_points = []
+    def _reconstruct_path(self, came_from: Dict, current: Tuple[float, float]) -> List[Tuple[float, float]]:
+        """Reconstruct path from A* search result."""
+        path = [current]
+        while current in came_from:
+            current = came_from[current]
+            path.append(current)
         
-        for point in route_points:
-            weather = self._get_nearest_weather(point.position, weather_data)
-            if weather:
-                # Adjust altitude based on weather conditions
-                new_altitude = self._adjust_altitude_for_weather(point.altitude, weather)
+        path = list(reversed(path))
+        
+        print(f"Found path with {len(path)} waypoints")
+        for i, point in enumerate(path):
+            print(f"Waypoint {i}: {point}")
+            
+        # minimum waypoints
+        if len(path) < 3:
+            midpoint = (
+                (path[0][0] + path[-1][0]) / 2,
+                (path[0][1] + path[-1][1]) / 2
+            )
+            # Adjust midpoint if too close to NFZ
+            nfz_dist = self._calculate_distance(self.base_position, midpoint)
+            if nfz_dist < self.no_fly_radius * 1.2:
+                offset = 0.01  # About 1km
+                if midpoint[1] < self.base_position[1]:
+                    midpoint = (midpoint[0], midpoint[1] - offset)
+                else:
+                    midpoint = (midpoint[0], midpoint[1] + offset)
+            path = [path[0], midpoint, path[-1]]
+        
+        return path
+
+    def _is_valid_point(self, point: Tuple[float, float]) -> bool:
+        """Check if point is valid and not in no-fly zone."""
+        lat, lon = point
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            return False
+            
+        distance = self._calculate_distance(self.base_position, point)
+        if distance <= self.no_fly_radius * 0.8:  
+            print(f"Point {point} rejected - too close to no-fly zone")
+            return False
+            
+        return True
+
+    def _calculate_weather_cost(self, point: Tuple[float, float], weather: WeatherCondition) -> float:
+        """Calculate weather-based cost factor."""
+        base_cost = 0.0
+        
+        # Wind cost
+        if weather.wind_speed > 8:
+            base_cost += (weather.wind_speed - 8) * 0.1
+            
+        # Visibility cost
+        if weather.visibility < 5:
+            base_cost += (5 - weather.visibility) * 0.1
+            
+        # Add position-based variation
+        lat_factor = abs(point[0] - self.base_position[0]) * 0.02
+        lon_factor = abs(point[1] - self.base_position[1]) * 0.02
+        
+        return base_cost + lat_factor + lon_factor
+
+    def _calculate_safe_altitude(self, point: Tuple[float, float], weather: Optional[WeatherCondition]) -> float:
+        """Calculate safe altitude considering weather and NFZ."""
+        base_altitude = self.min_altitude + self.safety_margin
+        
+        # Increase altitude near NFZ
+        nfz_dist = self._calculate_distance(self.base_position, point)
+        if nfz_dist < self.no_fly_radius * 1.5:
+            base_altitude += 50 * (1 - (nfz_dist / (self.no_fly_radius * 1.5)))
+            
+        if weather and weather.wind_speed > 8:
+            base_altitude += (weather.wind_speed - 8) * 10
                 
-                optimized_points.append(RoutePoint(
-                    position=point.position,
-                    altitude=new_altitude,
-                    time=point.time,
-                    weather=weather
-                ))
-
-        return optimized_points
-
-    def _smooth_path(self, route_points: List[RoutePoint]) -> List[RoutePoint]:
-        """Apply path smoothing to remove unnecessary waypoints."""
-        if len(route_points) <= 2:
-            return route_points
-
-        smoothed = [route_points[0]]
-        current_idx = 1
-
-        while current_idx < len(route_points) - 1:
-            prev_point = smoothed[-1]
-            current_point = route_points[current_idx]
-            next_point = route_points[current_idx + 1]
-
-            # Check if we can skip the current point
-            if self._can_skip_point(prev_point, current_point, next_point):
-                current_idx += 1
-                continue
-
-            smoothed.append(current_point)
-            current_idx += 1
-
-        smoothed.append(route_points[-1])
-        return smoothed
+        return min(base_altitude, self.max_altitude)
 
     def _calculate_distance(self, point1: Tuple[float, float], point2: Tuple[float, float]) -> float:
-        """Calculate distance between two points using Haversine formula."""
+        """Calculate distance using Haversine formula."""
         lat1, lon1 = point1
         lat2, lon2 = point2
         
         R = 6371  # Earth's radius in kilometers
-        
         dlat = math.radians(lat2 - lat1)
         dlon = math.radians(lon2 - lon1)
         
@@ -178,102 +242,30 @@ class RouteOptimizer:
         c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
         return R * c
 
-    def _is_in_no_fly_zone(self, point: Tuple[float, float]) -> bool:
-        """Check if a point is within any no-fly zone."""
-        def point_in_polygon(x: float, y: float, polygon: List[Tuple[float, float]]) -> bool:
-            n = len(polygon)
-            inside = False
-            p1x, p1y = polygon[0]
-            for i in range(n + 1):
-                p2x, p2y = polygon[i % n]
-                if y > min(p1y, p2y):
-                    if y <= max(p1y, p2y):
-                        if x <= max(p1x, p2x):
-                            if p1y != p2y:
-                                xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
-                            if p1x == p2x or x <= xinters:
-                                inside = not inside
-                p1x, p1y = p2x, p2y
-            return inside
+    def _is_goal_reached(self, current: Tuple[float, float], goal: Tuple[float, float]) -> bool:
+        """Check if current point is close enough to goal."""
+        return self._calculate_distance(current, goal) < self.grid_size
 
-        return any(point_in_polygon(point[0], point[1], zone) for zone in self.no_fly_zones)
-
-    def _calculate_optimal_altitude(self, point: Tuple[float, float]) -> float:
-        """Calculate optimal altitude considering obstacles and minimum safety height."""
-        # Start with minimum altitude
-        altitude = self.min_altitude
-
-        # Check distance to nearest no-fly zone and adjust altitude if needed
-        for zone in self.no_fly_zones:
-            min_distance = min(self._calculate_distance(point, zone_point) for zone_point in zone)
-            if min_distance < 1.0:  # If within 1km of no-fly zone
-                # Increase altitude based on proximity
-                altitude = min(
-                    self.max_altitude,
-                    altitude + (1.0 - min_distance) * self.safety_margin
-                )
-
-        return altitude
-
-    def _get_nearest_weather(self, 
-                           position: Tuple[float, float],
-                           weather_data: Dict[Tuple[float, float], WeatherCondition]) -> Optional[WeatherCondition]:
-        """Get weather data from nearest weather station."""
-        if not weather_data:
-            return None
-
-        nearest_point = min(
-            weather_data.keys(),
-            key=lambda x: self._calculate_distance(position, x)
-        )
-        return weather_data[nearest_point]
-
-    def _adjust_altitude_for_weather(self, 
-                                   current_altitude: float,
-                                   weather: WeatherCondition) -> float:
-        """Adjust altitude based on weather conditions."""
-        adjusted_altitude = current_altitude
-
-        # Adjust for wind speed
-        if weather.wind_speed > 10:  # m/s
-            adjusted_altitude += min(50, weather.wind_speed * 2)
-
-        # Adjust for poor visibility
-        if weather.visibility < 5:  # km
-            adjusted_altitude += (5 - weather.visibility) * 20
-
-        # Adjust for precipitation
-        if weather.precipitation > 0:
-            adjusted_altitude += min(30, weather.precipitation * 5)
-
-        # Ensure altitude stays within bounds
-        return max(self.min_altitude, min(self.max_altitude, adjusted_altitude))
-
-    def _can_skip_point(self,
-                       prev: RoutePoint,
-                       current: RoutePoint,
-                       next_point: RoutePoint) -> bool:
-        """Determine if a point can be skipped in path smoothing."""
-        # Check if skipping the point would create a path through a no-fly zone
-        if self._is_in_no_fly_zone(current.position):
-            return False
-
-        # Check if altitude change is too dramatic
-        altitude_change = abs(prev.altitude - next_point.altitude)
-        if altitude_change > self.safety_margin:
-            return False
-
-        return True
-
-    def _reconstruct_path(self,
-                         came_from: Dict[Tuple[float, float], Tuple[float, float]],
-                         current: Tuple[float, float],
-                         start: Tuple[float, float]) -> List[Tuple[float, float]]:
-        """Reconstruct path from A* search result."""
-        path = [current]
-        while current in came_from:
-            current = came_from[current]
-            path.append(current)
-        path.reverse()
-        return path
+    def _create_fallback_path(self, start: Tuple[float, float], end: Tuple[float, float]) -> List[RoutePoint]:
+        """Create a safe fallback path with proper NFZ avoidance."""
+        current_time = datetime.utcnow()
+        
+        # Calculate midpoint with offset
+        mid_lat = (start[0] + end[0]) / 2
+        offset = self.no_fly_radius * 1.5
+        
+        # Choose offset direction
+        if start[1] < self.base_position[1]:
+            mid_lon = start[1] - offset
+        else:
+            mid_lon = start[1] + offset
             
+        return [
+            RoutePoint(start, self.min_altitude + self.safety_margin, current_time),
+            RoutePoint(
+                (mid_lat, mid_lon),
+                self.min_altitude + self.safety_margin + 50,
+                current_time + timedelta(minutes=2)
+            ),
+            RoutePoint(end, self.min_altitude + self.safety_margin, current_time + timedelta(minutes=4))
+        ]

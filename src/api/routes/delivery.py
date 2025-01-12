@@ -1,11 +1,13 @@
-from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, status
 from sqlalchemy.orm import Session
-from typing import List, Optional
-from datetime import datetime
+from typing import List, Optional, Tuple
+from datetime import datetime, timedelta
 
-from ..dependencies import get_db, get_fleet_manager
-from ..schemas.models import DeliveryCreate, DeliveryUpdate, DeliveryResponse
+from src.api.schemas.enums import DeliveryStatus, DeliveryPriority
+from src.api.dependencies import get_db, get_fleet_manager
+from src.api.schemas.models import DeliveryCreate, DeliveryUpdate, DeliveryResponse
 from src.database import models
+from src.simulation.route import RoutePoint
 
 router = APIRouter()
 
@@ -16,38 +18,129 @@ async def create_delivery(
     db: Session = Depends(get_db),
     fleet_manager = Depends(get_fleet_manager)
 ):
-    """Create a new delivery request."""
-    drone_id = fleet_manager.assign_delivery(
-        destination=delivery.destination,
-        payload_weight=delivery.payload_weight
-    )
-    
-    if not drone_id:
-        raise HTTPException(status_code=400, detail="No available drones")
+    """Create a new delivery request with optimized route."""
+    try:
+        print("Starting delivery creation...")
+        
+        # Validate input coordinates
+        if not _validate_coordinates(delivery.destination):
+            raise HTTPException(status_code=400, detail="Invalid destination coordinates")
 
-    drone = fleet_manager.get_drone(drone_id)
-    route = fleet_manager.get_drone_route(drone_id)
-    
-    db_delivery = models.Delivery(
-        drone_id=drone_id,
-        status="in_progress",
-        start_time=datetime.utcnow(),
-        start_latitude=drone.position[0],
-        start_longitude=drone.position[1],
-        destination_latitude=delivery.destination[0],
-        destination_longitude=delivery.destination[1],
-        payload_weight=delivery.payload_weight
-    )
-    db.add(db_delivery)
-    db.commit()
-    
-    return {
-        "delivery_id": db_delivery.id,
-        "drone_id": drone_id,
-        "status": "in_progress",
-        "estimated_delivery_time": len(route) * 2 if route else None,
-        "route": route
-    }
+        # Get available drone
+        drone_id = fleet_manager.assign_delivery(
+            destination=delivery.destination,
+            payload_weight=delivery.payload_weight
+        )
+        
+        if not drone_id:
+            raise HTTPException(status_code=400, detail="No available drones")
+
+        print(f"Delivery assigned to drone: {drone_id}")
+        
+        # Get route
+        drone = fleet_manager.get_drone(drone_id)
+        route = fleet_manager.get_drone_route(drone_id)
+        
+        if not route:
+            print("Warning: No route calculated")
+            current_time = datetime.utcnow()
+            route = [
+                RoutePoint(
+                    position=drone.position,
+                    altitude=100.0,
+                    time=current_time
+                ),
+                RoutePoint(
+                    position=delivery.destination,
+                    altitude=100.0,
+                    time=current_time + timedelta(minutes=2)
+                )
+            ]
+
+        # Calculate total distance and estimated time
+        total_distance = 0
+        for i in range(len(route)-1):
+            start_point = route[i].position
+            end_point = route[i+1].position
+            segment_distance = fleet_manager.route_optimizer._calculate_distance(start_point, end_point)
+            total_distance += segment_distance
+
+        # Calculate estimated delivery time based on drone speed and distance
+        avg_speed = drone.specification.max_speed * 0.7  # 70% of max speed for safety
+        flight_time = (total_distance / avg_speed) * 60  # Convert to minutes
+        buffer_time = 4  # Buffer time for takeoff/landing
+        estimated_time = int(flight_time) + buffer_time
+
+        print(f"Route calculated - Distance: {total_distance:.2f}km, Estimated time: {estimated_time} minutes")
+
+        # Format route for storage
+        route_json = [
+            {
+                "lat": float(point.position[0]),
+                "lon": float(point.position[1]),
+                "altitude": float(point.altitude),
+                "timestamp": point.time.timestamp()
+            }
+            for point in route
+        ]
+
+        # Create delivery record
+        try:
+            db_delivery = models.Delivery(
+                drone_id=drone_id,
+                status=DeliveryStatus.IN_PROGRESS,
+                start_time=datetime.utcnow(),
+                start_latitude=float(drone.position[0]),
+                start_longitude=float(drone.position[1]),
+                destination_latitude=float(delivery.destination[0]),
+                destination_longitude=float(delivery.destination[1]),
+                payload_weight=float(delivery.payload_weight),
+                priority=delivery.priority,
+                notes=delivery.notes,
+                route=route_json,
+                estimated_delivery_time=estimated_time
+            )
+
+            db.add(db_delivery)
+            db.commit()
+            db.refresh(db_delivery)
+
+        except Exception as e:
+            db.rollback()
+            print(f"Database error: {str(e)}")
+            raise HTTPException(status_code=500, detail="Database error occurred")
+
+        # Prepare response
+        response_data = {
+            "delivery_id": db_delivery.id,
+            "drone_id": drone_id,
+            "status": DeliveryStatus.IN_PROGRESS.value,
+            "route": route_json,
+            "estimated_delivery_time": estimated_time,
+            "start_time": db_delivery.start_time,
+            "completion_time": None,
+            "payload_weight": delivery.payload_weight,
+            "priority": delivery.priority,
+            "notes": delivery.notes
+        }
+
+        print("Delivery created successfully")
+        return response_data
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Unexpected error: {str(e)}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+def _validate_coordinates(coords: Tuple[float, float]) -> bool:
+    """Validate latitude and longitude coordinates."""
+    try:
+        lat, lon = coords
+        return -90 <= lat <= 90 and -180 <= lon <= 180
+    except Exception:
+        return False
 
 @router.get("/", response_model=List[DeliveryResponse])
 async def get_deliveries(

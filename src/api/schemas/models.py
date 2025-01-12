@@ -3,30 +3,32 @@ from typing import List, Tuple, Dict, Optional
 from datetime import datetime
 from .enums import DroneStatus, DeliveryStatus, MaintenanceType
 
-
-class FleetAnalyticsResponse(BaseModel):
-    total_drones: int
-    active_drones: int
-    available_drones: int
-    average_battery_level: float
-    total_deliveries: int
-    fleet_utilization: float
-
-# Drone Schemas
+# Base Models
 class DroneSpecificationSchema(BaseModel):
     model: str
-    max_speed: float
-    max_battery_life: float
-    max_payload: float
-    charging_time: float
-    max_altitude: float
-    min_altitude: float
-    max_wind_speed: float
-    max_precipitation: float
-    battery_capacity: float
-    power_consumption_rate: float
-    emergency_reserve: float
+    max_speed: float = Field(..., gt=0)
+    max_payload: float = Field(..., gt=0)
+    max_altitude: float = Field(..., gt=0)
+    min_altitude: float = Field(..., gt=0)
+    max_wind_speed: float = Field(..., gt=0)
+    battery_capacity: float = Field(..., gt=0)
+    power_consumption_rate: float = Field(..., gt=0)
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "model": "DJI-X1",
+                "max_speed": 20.0,
+                "max_payload": 2.5,
+                "max_altitude": 400.0,
+                "min_altitude": 50.0,
+                "max_wind_speed": 15.0,
+                "battery_capacity": 500.0,
+                "power_consumption_rate": 100.0
+            }
+        }
 
+# Drone Models
 class DroneCreate(BaseModel):
     initial_position: Tuple[float, float]
     specification: DroneSpecificationSchema
@@ -45,12 +47,14 @@ class DroneResponse(BaseModel):
     maintenance_score: float
     component_health: Dict[str, float]
     specification: Dict
+    current_delivery: Optional[Dict]
+    total_flight_hours: float
+    last_maintenance: datetime
 
     class Config:
         orm_mode = True
 
-# Delivery Schemas
-
+# Delivery Models
 class DeliveryCreate(BaseModel):
     destination: Tuple[float, float]
     payload_weight: float = Field(..., gt=0, le=10)
@@ -72,11 +76,17 @@ class DeliveryUpdate(BaseModel):
     notes: Optional[str]
     priority: Optional[str]
 
+class RoutePoint(BaseModel):
+    lat: float
+    lon: float
+    altitude: float
+    timestamp: float
+
 class DeliveryResponse(BaseModel):
     delivery_id: int
     drone_id: str
     status: DeliveryStatus
-    route: Optional[List[Tuple[float, float]]]
+    route: Optional[List[RoutePoint]]
     estimated_delivery_time: Optional[int]
     start_time: datetime
     completion_time: Optional[datetime]
@@ -87,32 +97,7 @@ class DeliveryResponse(BaseModel):
     class Config:
         orm_mode = True
 
-# Fleet Schemas
-class FleetStatusResponse(BaseModel):
-    total_drones: int
-    available_drones: int
-    active_deliveries: int
-    weather_conditions: Dict
-    drones: List[DroneResponse]
-
-class WeatherResponse(BaseModel):
-    conditions: Dict
-    is_safe_for_flight: bool
-
-    class Config:
-        schema_extra = {
-            "example": {
-                "conditions": {
-                    "wind_speed": 5.2,
-                    "wind_direction": 180.0,
-                    "precipitation": 0.0,
-                    "visibility": 10.0
-                },
-                "is_safe_for_flight": True
-            }
-        }
-
-
+# Maintenance Models
 class MaintenanceCreate(BaseModel):
     maintenance_type: MaintenanceType
     description: Optional[str]
@@ -145,7 +130,7 @@ class MaintenanceResponse(BaseModel):
     class Config:
         orm_mode = True
 
-# Route Schemas
+# Route Models
 class RouteUpdate(BaseModel):
     destination: Tuple[float, float]
     waypoints: Optional[List[Tuple[float, float]]]
@@ -160,3 +145,37 @@ class RouteUpdate(BaseModel):
                 ]
             }
         }
+
+# Fleet Models
+class FleetStatusResponse(BaseModel):
+    total_drones: int
+    available_drones: int
+    active_deliveries: int
+    weather_conditions: Dict
+    drones: List[DroneResponse]
+
+class WeatherResponse(BaseModel):
+    conditions: Dict
+    is_safe_for_flight: bool
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "conditions": {
+                    "wind_speed": 5.2,
+                    "wind_direction": 180.0,
+                    "precipitation": 0.0,
+                    "visibility": 10.0,
+                    "temperature": 22.5
+                },
+                "is_safe_for_flight": True
+            }
+        }
+
+class FleetAnalyticsResponse(BaseModel):
+    total_drones: int
+    active_drones: int
+    available_drones: int
+    average_battery_level: float
+    total_deliveries: int
+    fleet_utilization: float

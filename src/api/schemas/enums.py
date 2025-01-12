@@ -20,3 +20,9 @@ class MaintenanceType(str, Enum):
     REPAIR = "repair"
     EMERGENCY = "emergency"
     INSPECTION = "inspection"
+
+class DeliveryPriority(str, Enum):
+    LOW = "low"
+    NORMAL = "normal"
+    HIGH = "high"
+    EMERGENCY = "emergency"

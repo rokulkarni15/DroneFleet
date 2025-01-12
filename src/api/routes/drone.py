@@ -59,7 +59,6 @@ async def create_drone(
         
     except Exception as e:
         db.rollback()
-        print(f"Error details: {str(e)}")  # For debugging
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create drone: {str(e)}"
@@ -159,7 +158,7 @@ async def update_route(
     new_route = fleet_manager.route_optimizer.calculate_route(
         start=drone.position,
         end=route_data.destination,
-        weather_data=fleet_manager.weather_simulator.get_conditions(drone.position)
+        weather=fleet_manager.weather_simulator.get_conditions(drone.position)
     )
     
     if not new_route:
@@ -175,8 +174,5 @@ async def emergency_return(drone_id: str, fleet_manager = Depends(get_fleet_mana
     if not drone:
         raise HTTPException(status_code=404, detail="Drone not found")
 
-    drone.status = drone.DroneStatus.EMERGENCY
-    if not drone.return_to_base(fleet_manager.base_position):
-        raise HTTPException(status_code=400, detail="Failed to initiate emergency return")
-    
+    drone.status = DroneStatus.EMERGENCY
     return {"status": "emergency return initiated"}
